@@ -7,12 +7,15 @@ import argparse
 import json
 import os
 import sys
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
 import anyio
 from mcp import Client, types
 from mcp.client.stdio import StdioServerParameters, stdio_client
+from mcp.shared.exceptions import MCPError
+from mcp.types import INVALID_PARAMS, METHOD_NOT_FOUND
 
 if sys.version_info < (3, 11):
     from exceptiongroup import BaseExceptionGroup  # type: ignore[no-redef]
@@ -46,6 +49,111 @@ READONLY_TOOL_CASES = (
             "apiName": "DescribeRegions",
         },
     ),
+)
+
+ALL_TOOL_STATIC_CASES = (
+    (
+        "AlibabaCloud___SearchApis",
+        {
+            "prompt": "List the Alibaba Cloud API for querying ECS regions",
+            "limit": 1,
+        },
+    ),
+    (
+        "AlibabaCloud___CallCLI",
+        {"command": "aliyun ecs DescribeRegions"},
+    ),
+    (
+        "AlibabaCloud___GetApiDefinition",
+        {
+            "product": "Ecs",
+            "apiVersion": "2014-05-26",
+            "apiName": "DescribeRegions",
+        },
+    ),
+    (
+        "AlibabaCloud___ListApis",
+        {
+            "product": "Ecs",
+            "apiVersion": "2014-05-26",
+            "filter": "DescribeRegions",
+            "includeApiDefinition": False,
+        },
+    ),
+    (
+        "AlibabaCloud___ListProductRegions",
+        {"product": "Ecs"},
+    ),
+    (
+        "AlibabaCloud___GenerateCLICommand",
+        {
+            "product": "Ecs",
+            "apiVersion": "2014-05-26",
+            "apiName": "DescribeRegions",
+        },
+    ),
+    (
+        "AlibabaCloud___ListProducts",
+        {"filter": "Ecs"},
+    ),
+    (
+        "AlibabaCloud___SearchDocuments",
+        {
+            "query": "ECS 地域和可用区",
+            "product": "ecs",
+            "limit": 1,
+            "website": "cn",
+            "language": "zh",
+        },
+    ),
+    (
+        "AlibabaCloud___GetDocumentTree",
+        {
+            "product": "ecs",
+            "depth": 1,
+            "website": "cn",
+            "language": "zh",
+        },
+    ),
+    (
+        "AlibabaCloud___GrepDocuments",
+        {
+            "product": "ecs",
+            "pattern": "实例",
+            "limit": 1,
+            "website": "cn",
+            "language": "zh",
+        },
+    ),
+    (
+        "AlibabaCloud___GetPresignedUrl",
+        {
+            "requests": [
+                {
+                    "operation": "upload",
+                    "expires_in": 60,
+                }
+            ]
+        },
+    ),
+)
+
+EXPECTED_PREPROD_TOOL_NAMES = (
+    "AlibabaCloud___SearchApis",
+    "AlibabaCloud___CallCLI",
+    "AlibabaCloud___GetApiDefinition",
+    "AlibabaCloud___ListApis",
+    "AlibabaCloud___ListProductRegions",
+    "AlibabaCloud___GenerateCLICommand",
+    "AlibabaCloud___ListProducts",
+    "AlibabaCloud___SearchDocuments",
+    "AlibabaCloud___GetDocument",
+    "AlibabaCloud___GetDocumentTree",
+    "AlibabaCloud___GrepDocuments",
+    "AlibabaCloud___GetPresignedUrl",
+    RUNSCRIPT_TOOL,
+    GET_TASK_TOOL,
+    "AlibabaCloud___RunIaC",
 )
 
 RUNSCRIPT_SOURCE = (
@@ -189,6 +297,18 @@ def validate_successful_task(task: dict[str, Any]) -> None:
         )
 
 
+def summarize_completed_task(task: dict[str, Any]) -> dict[str, Any]:
+    validate_successful_task(task)
+    return {
+        "phase": "runscript-complete",
+        "processID": extract_process_id(task),
+        "status": task.get("status"),
+        "nextAction": task.get("nextAction"),
+        "waitTimedOut": task.get("waitTimedOut"),
+        "resultNonempty": bool(task.get("result")),
+    }
+
+
 def build_server_parameters(args: argparse.Namespace) -> StdioServerParameters:
     repository_root = Path(__file__).resolve().parents[1]
     child_env = os.environ.copy()
@@ -233,10 +353,76 @@ def print_json(value: Any) -> None:
     )
 
 
+def summarize_tool_contract(tool: types.Tool) -> dict[str, Any]:
+    schema = tool.input_schema
+    required = schema.get("required")
+    properties = schema.get("properties")
+    return {
+        "name": tool.name,
+        "inputType": schema.get("type"),
+        "required": sorted(required) if isinstance(required, list) else [],
+        "properties": (
+            sorted(properties)
+            if isinstance(properties, dict)
+            else []
+        ),
+        "hasOutputSchema": tool.output_schema is not None,
+    }
+
+
 def build_readonly_tool_cases() -> tuple[tuple[str, dict[str, Any]], ...]:
     return tuple(
         (tool_name, dict(arguments))
         for tool_name, arguments in READONLY_TOOL_CASES
+    )
+
+
+def build_all_tool_static_cases() -> tuple[tuple[str, dict[str, Any]], ...]:
+    return tuple(
+        (tool_name, dict(arguments))
+        for tool_name, arguments in ALL_TOOL_STATIC_CASES
+    )
+
+
+def validate_expected_tool_surface(tool_names: list[str]) -> None:
+    expected = Counter(EXPECTED_PREPROD_TOOL_NAMES)
+    actual = Counter(tool_names)
+    if actual == expected:
+        return
+    missing = sorted((expected - actual).elements())
+    unexpected = sorted((actual - expected).elements())
+    raise RuntimeError(
+        "Preprod tool surface differs from the expected 15-tool contract: "
+        f"missing={missing}, unexpected={unexpected}"
+    )
+
+
+def build_get_document_arguments(
+    search_result: types.CallToolResult,
+) -> dict[str, Any]:
+    payload = extract_result_payload(search_result)
+    results = payload.get("results")
+    if not isinstance(results, list) or not results:
+        raise RuntimeError(
+            "SearchDocuments did not return a document reference."
+        )
+    first = results[0]
+    if not isinstance(first, dict):
+        raise RuntimeError(
+            "SearchDocuments did not return a document reference."
+        )
+
+    doc_id = first.get("doc_id")
+    if isinstance(doc_id, int) and doc_id > 0:
+        return {"doc_id": doc_id, "max_length": 1024}
+    if isinstance(doc_id, str) and doc_id.isdigit() and int(doc_id) > 0:
+        return {"doc_id": int(doc_id), "max_length": 1024}
+
+    url = first.get("url")
+    if isinstance(url, str) and url.strip():
+        return {"url": url, "max_length": 1024}
+    raise RuntimeError(
+        "SearchDocuments did not return a document reference."
     )
 
 
@@ -271,10 +457,184 @@ def summarize_readonly_tool_result(
     }
 
 
+def summarize_successful_tool_result(
+    tool_name: str,
+    result: types.CallToolResult,
+) -> dict[str, Any]:
+    summary = summarize_readonly_tool_result(tool_name, result)
+    summary["phase"] = "tool-success"
+    return summary
+
+
+def summarize_runiac_validation_result(
+    result: types.CallToolResult,
+) -> dict[str, Any]:
+    if result.is_error:
+        raise RuntimeError(
+            "AlibabaCloud___RunIaC returned an MCP tool error instead of "
+            "its contract validation result."
+        )
+    payload = extract_result_payload(result)
+    if payload.get("status") != "ValidationFailed" or payload.get("processID"):
+        raise RuntimeError(
+            "RunIaC did not reject the safe empty request before creating "
+            "a process."
+        )
+    return {
+        "phase": "tool-validation",
+        "tool": "AlibabaCloud___RunIaC",
+        "outcome": "expected-validation-rejection",
+        "status": payload.get("status"),
+        "nextAction": payload.get("nextAction"),
+        "processCreated": False,
+    }
+
+
 async def _run_readonly_tool_smoke(client: Client) -> None:
     for tool_name, arguments in build_readonly_tool_cases():
         result = await client.call_tool(tool_name, arguments)
         print_json(summarize_readonly_tool_result(tool_name, result))
+
+
+async def _run_all_tools_smoke(
+    client: Client,
+    args: argparse.Namespace,
+) -> None:
+    search_result: types.CallToolResult | None = None
+    for tool_name, arguments in build_all_tool_static_cases():
+        result = await client.call_tool(tool_name, arguments)
+        print_json(summarize_successful_tool_result(tool_name, result))
+        if tool_name == "AlibabaCloud___SearchDocuments":
+            search_result = result
+
+    if search_result is None:
+        raise RuntimeError("SearchDocuments was not executed.")
+    document_result = await client.call_tool(
+        "AlibabaCloud___GetDocument",
+        build_get_document_arguments(search_result),
+    )
+    print_json(
+        summarize_successful_tool_result(
+            "AlibabaCloud___GetDocument",
+            document_result,
+        )
+    )
+
+    await _run_runscript_smoke(client, args)
+
+    runiac_result = await client.call_tool(
+        "AlibabaCloud___RunIaC",
+        {},
+    )
+    print_json(summarize_runiac_validation_result(runiac_result))
+
+
+async def _run_protocol_behavior_smoke(
+    client: Client,
+    *,
+    mode: str,
+) -> None:
+    try:
+        await client.send_ping()
+    except MCPError as error:
+        if mode == "legacy":
+            raise
+        if error.code != METHOD_NOT_FOUND:
+            raise
+        print_json(
+            {
+                "phase": "ping",
+                "outcome": "expected-rejection",
+                "errorCode": error.code,
+            }
+        )
+    else:
+        if mode != "legacy":
+            raise RuntimeError(
+                "Modern proxy unexpectedly accepted removed ping method."
+            )
+        print_json({"phase": "ping", "outcome": "success"})
+
+    for tool_name, arguments, behavior in (
+        (
+            "AlibabaCloud___DefinitelyMissing",
+            {},
+            "unknown-tool",
+        ),
+        (
+            "AlibabaCloud___GetApiDefinition",
+            {},
+            "invalid-tool-arguments",
+        ),
+    ):
+        try:
+            result = await client.call_tool(tool_name, arguments)
+        except MCPError as error:
+            if error.code not in (INVALID_PARAMS, METHOD_NOT_FOUND):
+                raise
+            print_json(
+                {
+                    "phase": behavior,
+                    "tool": tool_name,
+                    "outcome": "expected-rejection",
+                    "errorCode": error.code,
+                }
+            )
+            continue
+        if not result.is_error:
+            raise RuntimeError(
+                f"{behavior} unexpectedly returned isError=false."
+            )
+        print_json(
+            {
+                "phase": behavior,
+                "tool": tool_name,
+                "outcome": "expected-rejection",
+            }
+        )
+
+    surface_calls = (
+        ("prompts/list", client.list_prompts),
+        ("resources/list", client.list_resources),
+        ("resources/templates/list", client.list_resource_templates),
+    )
+    for method, operation in surface_calls:
+        try:
+            result = await operation()
+        except MCPError as error:
+            if error.code != METHOD_NOT_FOUND:
+                raise
+            outcome = (
+                "expected-rejection"
+                if mode != "legacy"
+                else "upstream-rejection"
+            )
+            print_json(
+                {
+                    "phase": method,
+                    "outcome": outcome,
+                    "errorCode": error.code,
+                }
+            )
+            continue
+
+        if mode != "legacy":
+            raise RuntimeError(
+                f"Modern tool-only proxy unexpectedly accepted {method}."
+            )
+        item_count = 0
+        for attribute in ("prompts", "resources", "resource_templates"):
+            items = getattr(result, attribute, None)
+            if isinstance(items, list):
+                item_count = len(items)
+                break
+        print_json(
+            {
+                "phase": method,
+                "outcome": "success",
+                "itemCount": item_count,
+            }
+        )
 
 
 async def _run_parallel_list_smoke(
@@ -369,13 +729,7 @@ async def _run_runscript_smoke(
 
         if status in TERMINAL_STATUSES:
             validate_successful_task(task)
-            print_json(
-                {
-                    "phase": "runscript-complete",
-                    "processID": process_id,
-                    "task": task,
-                }
-            )
+            print_json(summarize_completed_task(task))
             return task
         if status not in NON_TERMINAL_STATUSES:
             raise RuntimeError(
@@ -419,9 +773,11 @@ async def run_e2e(args: argparse.Namespace) -> None:
         )
 
         tool_names: list[str] = []
+        listed_tools: list[types.Tool] = []
         for iteration in range(1, args.list_repeat_count + 1):
             tools_result = await client.list_tools()
-            tool_names = [tool.name for tool in tools_result.tools]
+            listed_tools = tools_result.tools
+            tool_names = [tool.name for tool in listed_tools]
             print_json(
                 {
                     "phase": "tools/list",
@@ -443,12 +799,31 @@ async def run_e2e(args: argparse.Namespace) -> None:
                     f"resultType={tools_result.result_type!r}"
                 )
 
+        if args.print_tool_contracts:
+            print_json(
+                {
+                    "phase": "tool-contracts",
+                    "toolCount": len(listed_tools),
+                    "tools": [
+                        summarize_tool_contract(tool)
+                        for tool in listed_tools
+                    ],
+                }
+            )
+
         if args.parallel_list_count:
             await _run_parallel_list_smoke(
                 client,
                 count=args.parallel_list_count,
                 require_complete=args.mode in ("auto", "2026-07-28"),
             )
+
+        if args.run_protocol_behavior_smoke:
+            await _run_protocol_behavior_smoke(client, mode=args.mode)
+
+        if args.run_all_tools_smoke:
+            validate_expected_tool_surface(tool_names)
+            await _run_all_tools_smoke(client, args)
 
         if args.run_readonly_tool_smoke:
             missing_readonly_tools = {
@@ -528,6 +903,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--run-readonly-tool-smoke",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--print-tool-contracts",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--run-all-tools-smoke",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--run-protocol-behavior-smoke",
         action="store_true",
     )
     parser.add_argument(

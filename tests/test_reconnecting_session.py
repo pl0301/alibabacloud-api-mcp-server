@@ -5,6 +5,8 @@ from typing import Any
 import anyio
 import pytest
 from mcp import types
+from mcp.shared.exceptions import MCPError
+from mcp.types import INTERNAL_ERROR, INVALID_PARAMS
 
 from alibabacloud.mcp_proxy.config import RetrySettings
 from alibabacloud.mcp_proxy.protocol import (
@@ -13,7 +15,10 @@ from alibabacloud.mcp_proxy.protocol import (
     ProtocolModeMismatchError,
     UnsupportedProtocolFeatureError,
 )
-from alibabacloud.mcp_proxy.session.reconnecting_session import ReconnectingSession
+from alibabacloud.mcp_proxy.session.reconnecting_session import (
+    ReconnectingSession,
+    UpstreamSessionError,
+)
 from alibabacloud.mcp_proxy.transport.http_client import ProxyDependencyError
 
 
@@ -35,10 +40,12 @@ class FakeConnection:
         fail_once: bool = False,
         permanent_error: bool = False,
         tool_error_result: bool = False,
+        mcp_error_code: int | None = None,
     ) -> None:
         self.fail_once = fail_once
         self.permanent_error = permanent_error
         self.tool_error_result = tool_error_result
+        self.mcp_error_code = mcp_error_code
         self.closed = False
         self.calls = 0
 
@@ -53,6 +60,11 @@ class FakeConnection:
             raise RuntimeError("401 token expired")
         if self.permanent_error:
             raise UnsupportedProtocolFeatureError("input_required is not supported")
+        if self.mcp_error_code is not None:
+            raise MCPError(
+                code=self.mcp_error_code,
+                message="MCP request failed",
+            )
         if self.tool_error_result:
             return types.CallToolResult(content=[], isError=True)
         return types.CallToolResult(
@@ -75,10 +87,12 @@ class FakeConnectionFactory:
         fail_first_connection: bool = True,
         permanent_error: bool = False,
         tool_error_result: bool = False,
+        mcp_error_code: int | None = None,
     ) -> None:
         self.fail_first_connection = fail_first_connection
         self.permanent_error = permanent_error
         self.tool_error_result = tool_error_result
+        self.mcp_error_code = mcp_error_code
         self.connections: list[FakeConnection] = []
         self.connect_calls: list[tuple[str, ProtocolMode]] = []
 
@@ -93,6 +107,7 @@ class FakeConnectionFactory:
             fail_once=self.fail_first_connection and len(self.connections) == 0,
             permanent_error=self.permanent_error,
             tool_error_result=self.tool_error_result,
+            mcp_error_code=self.mcp_error_code,
         )
         self.connections.append(connection)
         return connection
@@ -322,6 +337,80 @@ async def test_tool_error_result_is_returned_without_retry() -> None:
 
     assert result.is_error is True
     assert connection_factory.connect_calls == [("token", MODERN_PROTOCOL_MODE)]
+
+
+@pytest.mark.asyncio
+async def test_mcp_error_is_preserved_without_retry() -> None:
+    token_provider = FakeTokenProvider(["token"])
+    connection_factory = FakeConnectionFactory(
+        fail_first_connection=False,
+        mcp_error_code=INVALID_PARAMS,
+    )
+    session = ReconnectingSession(
+        connection_factory,
+        token_provider,
+        RetrySettings(
+            max_attempts=3,
+            base_delay_seconds=0.01,
+            max_delay_seconds=0.01,
+        ),
+    )
+
+    with pytest.raises(MCPError) as error:
+        await session.call_tool(
+            "missing",
+            {},
+            protocol_mode=MODERN_PROTOCOL_MODE,
+        )
+
+    assert error.value.code == INVALID_PARAMS
+    assert error.value.message == "MCP request failed"
+    assert token_provider.calls == [False]
+    assert connection_factory.connect_calls == [
+        ("token", MODERN_PROTOCOL_MODE),
+    ]
+    assert connection_factory.connections[0].calls == 1
+    assert connection_factory.connections[0].closed is False
+
+
+@pytest.mark.asyncio
+async def test_internal_mcp_error_retains_legacy_retry_behavior() -> None:
+    token_provider = FakeTokenProvider(["token"])
+    connection_factory = FakeConnectionFactory(
+        fail_first_connection=False,
+        mcp_error_code=INTERNAL_ERROR,
+    )
+    session = ReconnectingSession(
+        connection_factory,
+        token_provider,
+        RetrySettings(
+            max_attempts=3,
+            base_delay_seconds=0.01,
+            max_delay_seconds=0.01,
+        ),
+    )
+
+    with pytest.raises(
+        UpstreamSessionError,
+        match="failed after 3 attempts",
+    ):
+        await session.call_tool(
+            "transient",
+            {},
+            protocol_mode=MODERN_PROTOCOL_MODE,
+        )
+
+    assert token_provider.calls == [False, False, False]
+    assert len(connection_factory.connect_calls) == 3
+    assert [connection.calls for connection in connection_factory.connections] == [
+        1,
+        1,
+        1,
+    ]
+    assert all(
+        connection.closed
+        for connection in connection_factory.connections
+    )
 
 
 @pytest.mark.asyncio

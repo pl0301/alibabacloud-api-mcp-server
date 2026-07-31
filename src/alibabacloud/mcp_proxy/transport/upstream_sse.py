@@ -233,15 +233,14 @@ async def _sse_background_worker(
                         return
 
                     error = LegacySseSessionExpiredError(
-                        f"Legacy SSE session expired (404): {response.text}",
+                        "Legacy SSE session expired (404)",
                         request=response.request,
                         response=response,
                     )
                 elif 500 <= response.status_code < 600:
                     await response.aread()
                     error = httpx2.HTTPStatusError(
-                        f"Legacy SSE POST failed ({response.status_code}): "
-                        f"{response.text}",
+                        f"Legacy SSE POST failed ({response.status_code})",
                         request=response.request,
                         response=response,
                     )

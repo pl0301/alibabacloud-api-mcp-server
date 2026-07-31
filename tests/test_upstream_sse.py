@@ -16,6 +16,7 @@ from alibabacloud.mcp_proxy.transport.upstream_sse import SseConnectionFactory
 @pytest.mark.asyncio
 async def test_legacy_session_404_reconnects_and_retries_request(
     aiohttp_server,
+    caplog,
 ) -> None:
     session_queues: dict[str, asyncio.Queue[dict[str, object]]] = {}
     created_sessions: list[str] = []
@@ -70,7 +71,12 @@ async def test_legacy_session_404_reconnects_and_retries_request(
             tools_list_sessions.append(session_id)
             if session_id == "session-1":
                 return web.json_response(
-                    {"error": f"Session not found: {session_id}"},
+                    {
+                        "error": (
+                            f"Session not found: {session_id} "
+                            "SECRET_RESPONSE_BODY"
+                        )
+                    },
                     status=404,
                 )
             await session_queues[session_id].put(
@@ -128,11 +134,13 @@ async def test_legacy_session_404_reconnects_and_retries_request(
     assert created_sessions == ["session-1", "session-2"]
     assert tools_list_sessions == ["session-1", "session-2"]
     assert token_provider.calls == [False, False]
+    assert "SECRET_RESPONSE_BODY" not in caplog.text
 
 
 @pytest.mark.asyncio
 async def test_initialize_503_reconnects_with_a_new_legacy_sse_session(
     aiohttp_server,
+    caplog,
 ) -> None:
     session_queues: dict[str, asyncio.Queue[dict[str, object]]] = {}
     created_sessions: list[str] = []
@@ -170,7 +178,10 @@ async def test_initialize_503_reconnects_with_a_new_legacy_sse_session(
         if method == "initialize":
             initialize_sessions.append(session_id)
             if session_id == "session-1":
-                return web.Response(status=503, text="Service Unavailable")
+                return web.Response(
+                    status=503,
+                    text="Service Unavailable SECRET_RESPONSE_BODY",
+                )
             await session_queues[session_id].put(
                 {
                     "jsonrpc": "2.0",
@@ -245,6 +256,7 @@ async def test_initialize_503_reconnects_with_a_new_legacy_sse_session(
     assert initialize_sessions == ["session-1", "session-2"]
     assert tools_list_sessions == ["session-2"]
     assert token_provider.calls == [False, False]
+    assert "SECRET_RESPONSE_BODY" not in caplog.text
 
 
 @pytest.mark.asyncio

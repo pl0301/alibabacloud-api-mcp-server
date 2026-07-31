@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 from mcp import types
+from mcp.shared.exceptions import MCPError
+from mcp.types import INVALID_PARAMS, METHOD_NOT_FOUND
 
 if sys.version_info < (3, 11):
     from exceptiongroup import ExceptionGroup
@@ -95,6 +97,238 @@ def test_readonly_result_summary_rejects_empty_response() -> None:
         )
 
 
+def test_tool_contract_summary_contains_only_safe_schema_shape() -> None:
+    tool = types.Tool(
+        name="AlibabaCloud___Example",
+        description="large or sensitive documentation must not be logged",
+        inputSchema={
+            "type": "object",
+            "required": ["product", "action"],
+            "properties": {
+                "product": {
+                    "type": "string",
+                    "description": "must not be logged",
+                },
+                "action": {"type": "string", "default": "DescribeRegions"},
+            },
+        },
+        outputSchema={"type": "object"},
+    )
+
+    assert _MODULE.summarize_tool_contract(tool) == {
+        "name": "AlibabaCloud___Example",
+        "inputType": "object",
+        "required": ["action", "product"],
+        "properties": ["action", "product"],
+        "hasOutputSchema": True,
+    }
+
+
+def test_tool_contract_summary_tolerates_non_object_schema_shape() -> None:
+    tool = types.Tool(
+        name="AlibabaCloud___Scalar",
+        inputSchema={"type": "string"},
+    )
+
+    assert _MODULE.summarize_tool_contract(tool) == {
+        "name": "AlibabaCloud___Scalar",
+        "inputType": "string",
+        "required": [],
+        "properties": [],
+        "hasOutputSchema": False,
+    }
+
+
+def test_all_tool_static_matrix_is_read_only_and_covers_safe_services() -> None:
+    cases = _MODULE.build_all_tool_static_cases()
+
+    assert tuple(name for name, _ in cases) == (
+        "AlibabaCloud___SearchApis",
+        "AlibabaCloud___CallCLI",
+        "AlibabaCloud___GetApiDefinition",
+        "AlibabaCloud___ListApis",
+        "AlibabaCloud___ListProductRegions",
+        "AlibabaCloud___GenerateCLICommand",
+        "AlibabaCloud___ListProducts",
+        "AlibabaCloud___SearchDocuments",
+        "AlibabaCloud___GetDocumentTree",
+        "AlibabaCloud___GrepDocuments",
+        "AlibabaCloud___GetPresignedUrl",
+    )
+    arguments = dict(cases)
+    assert arguments["AlibabaCloud___CallCLI"] == {
+        "command": "aliyun ecs DescribeRegions",
+    }
+    assert arguments["AlibabaCloud___GetPresignedUrl"] == {
+        "requests": [
+            {
+                "operation": "upload",
+                "expires_in": 60,
+            }
+        ],
+    }
+    assert "AlibabaCloud___RunIaC" not in arguments
+
+
+def test_exact_tool_surface_rejects_duplicate_names() -> None:
+    exact_names = list(_MODULE.EXPECTED_PREPROD_TOOL_NAMES)
+    _MODULE.validate_expected_tool_surface(exact_names)
+
+    with pytest.raises(RuntimeError, match="expected 15-tool contract"):
+        _MODULE.validate_expected_tool_surface(
+            [*exact_names, exact_names[0]]
+        )
+
+
+@pytest.mark.parametrize(
+    "payload, expected",
+    [
+        (
+            {
+                "results": [
+                    {
+                        "doc_id": 98985,
+                        "url": "https://help.aliyun.com/document_detail/98985.html",
+                    }
+                ]
+            },
+            {"doc_id": 98985, "max_length": 1024},
+        ),
+        (
+            {
+                "results": [
+                    {
+                        "url": "https://help.aliyun.com/zh/ecs/user-guide/regions",
+                    }
+                ]
+            },
+            {
+                "url": "https://help.aliyun.com/zh/ecs/user-guide/regions",
+                "max_length": 1024,
+            },
+        ),
+    ],
+)
+def test_document_arguments_are_derived_from_search_result(
+    payload: dict[str, object],
+    expected: dict[str, object],
+) -> None:
+    result = types.CallToolResult(
+        content=[
+            types.TextContent(
+                type="text",
+                text=__import__("json").dumps(payload),
+            )
+        ],
+        isError=False,
+    )
+
+    assert _MODULE.build_get_document_arguments(result) == expected
+
+
+def test_document_arguments_reject_empty_search_result() -> None:
+    result = types.CallToolResult(
+        content=[
+            types.TextContent(
+                type="text",
+                text='{"results":[]}',
+            )
+        ],
+        isError=False,
+    )
+
+    with pytest.raises(RuntimeError, match="document reference"):
+        _MODULE.build_get_document_arguments(result)
+
+
+def test_runiac_validation_summary_requires_pre_execution_rejection() -> None:
+    result = types.CallToolResult(
+        content=[
+            types.TextContent(
+                type="text",
+                text=(
+                    '{"status":"ValidationFailed","nextAction":"Stop",'
+                    '"error":{"code":"InvalidRequest"}}'
+                ),
+            )
+        ],
+        isError=False,
+    )
+
+    assert _MODULE.summarize_runiac_validation_result(result) == {
+        "phase": "tool-validation",
+        "tool": "AlibabaCloud___RunIaC",
+        "outcome": "expected-validation-rejection",
+        "status": "ValidationFailed",
+        "nextAction": "Stop",
+        "processCreated": False,
+    }
+
+
+def test_runiac_validation_summary_rejects_any_created_process() -> None:
+    result = types.CallToolResult(
+        content=[
+            types.TextContent(
+                type="text",
+                text='{"processID":"iac-unsafe","status":"Received"}',
+            )
+        ],
+        isError=False,
+    )
+
+    with pytest.raises(RuntimeError, match="before creating a process"):
+        _MODULE.summarize_runiac_validation_result(result)
+
+
+@pytest.mark.asyncio
+async def test_modern_protocol_behavior_smoke_checks_ping_and_rejections(
+    capsys,
+) -> None:
+    class RecordingClient:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def send_ping(self) -> None:
+            self.calls.append("ping")
+            raise MCPError(code=METHOD_NOT_FOUND, message="Method not found")
+
+        async def call_tool(
+            self,
+            name: str,
+            arguments: dict[str, object],
+        ) -> types.CallToolResult:
+            self.calls.append(name)
+            raise MCPError(code=INVALID_PARAMS, message="Invalid params")
+
+        async def list_prompts(self) -> None:
+            self.calls.append("prompts/list")
+            raise MCPError(code=METHOD_NOT_FOUND, message="Method not found")
+
+        async def list_resources(self) -> None:
+            self.calls.append("resources/list")
+            raise MCPError(code=METHOD_NOT_FOUND, message="Method not found")
+
+        async def list_resource_templates(self) -> None:
+            self.calls.append("resources/templates/list")
+            raise MCPError(code=METHOD_NOT_FOUND, message="Method not found")
+
+    client = RecordingClient()
+
+    await _MODULE._run_protocol_behavior_smoke(client, mode="2026-07-28")
+
+    assert client.calls == [
+        "ping",
+        "AlibabaCloud___DefinitelyMissing",
+        "AlibabaCloud___GetApiDefinition",
+        "prompts/list",
+        "resources/list",
+        "resources/templates/list",
+    ]
+    output = capsys.readouterr().out
+    assert '"phase": "ping"' in output
+    assert output.count('"outcome": "expected-rejection"') == 6
+
+
 @pytest.mark.asyncio
 async def test_readonly_smoke_calls_every_case_once(capsys) -> None:
     class RecordingClient:
@@ -139,6 +373,9 @@ def test_parser_accepts_fixed_modern_mode_and_repeated_list_calls() -> None:
             "--parallel-list-count",
             "10",
             "--run-readonly-tool-smoke",
+            "--print-tool-contracts",
+            "--run-all-tools-smoke",
+            "--run-protocol-behavior-smoke",
         ]
     )
 
@@ -146,6 +383,9 @@ def test_parser_accepts_fixed_modern_mode_and_repeated_list_calls() -> None:
     assert args.list_repeat_count == 3
     assert args.parallel_list_count == 10
     assert args.run_readonly_tool_smoke is True
+    assert args.print_tool_contracts is True
+    assert args.run_all_tools_smoke is True
+    assert args.run_protocol_behavior_smoke is True
 
 
 @pytest.mark.asyncio
@@ -275,6 +515,14 @@ def test_successful_get_task_requires_real_result() -> None:
     }
 
     validate_successful_task(task)
+    assert _MODULE.summarize_completed_task(task) == {
+        "phase": "runscript-complete",
+        "processID": "cli-success",
+        "status": "Succeeded",
+        "nextAction": None,
+        "waitTimedOut": False,
+        "resultNonempty": True,
+    }
 
 
 @pytest.mark.parametrize(

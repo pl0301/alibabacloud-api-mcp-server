@@ -7,6 +7,13 @@ from typing import Any, Awaitable, Callable, Protocol, TypeVar
 
 import anyio
 from mcp import types
+from mcp.shared.exceptions import MCPError
+from mcp.types import (
+    INVALID_PARAMS,
+    INVALID_REQUEST,
+    METHOD_NOT_FOUND,
+    PARSE_ERROR,
+)
 from pydantic import AnyUrl
 
 from alibabacloud.mcp_proxy.auth.token_provider import CachedBearerTokenProvider
@@ -192,11 +199,15 @@ class ReconnectingSession:
                     )
                     return await callback(connection)
                 except (ProxyDependencyError, NonRetryableProxyError):
-                    # Dependency, transport-mode, and feature errors are
-                    # permanent for this request. Preserve the actionable
-                    # exception instead of reconnecting or wrapping it.
+                    # Dependency failures, transport-mode errors, and feature
+                    # errors are permanent for this request.
                     raise
                 except Exception as exc:  # pragma: no cover - depends on upstream SDK exceptions
+                    if isinstance(exc, MCPError) and _is_request_mcp_error(exc):
+                        # A malformed or unsupported request will fail
+                        # identically after reconnecting. Preserve its JSON-RPC
+                        # error instead of replaying it.
+                        raise
                     last_error = exc
                     LOGGER.warning(
                         "Upstream %s failed on attempt %s/%s: %s",
@@ -306,3 +317,12 @@ def _should_force_refresh(error: Exception | None) -> bool:
         return True
     message = str(error).lower()
     return "401" in message or "403" in message or "unauthorized" in message
+
+
+def _is_request_mcp_error(error: MCPError) -> bool:
+    return error.code in {
+        PARSE_ERROR,
+        INVALID_REQUEST,
+        METHOD_NOT_FOUND,
+        INVALID_PARAMS,
+    }

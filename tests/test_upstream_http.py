@@ -7,6 +7,8 @@ import anyio
 import httpx2
 import pytest
 from aiohttp import web
+from mcp.shared.exceptions import MCPError
+from mcp.types import INVALID_PARAMS
 
 from alibabacloud.mcp_proxy.config import AlibabaCloudProxyConfig, RetrySettings
 from alibabacloud.mcp_proxy.protocol import UnsupportedProtocolFeatureError
@@ -15,8 +17,32 @@ from alibabacloud.mcp_proxy.transport.upstream_http import (
     StreamableHttpConnection,
     StreamableHttpConnectionFactory,
     UpstreamHttpResponseError,
+    _HttpAuditState,
     _RpcRequest,
 )
+
+
+def test_http_400_mcp_error_preserves_jsonrpc_semantics() -> None:
+    state = _HttpAuditState(protocol_mode="2026-07-28")
+    state.pending_error_status = 400
+    original = MCPError(code=INVALID_PARAMS, message="Invalid params")
+
+    result = state.wrap_error(original)
+
+    assert result is original
+    assert state.pending_error_status is None
+
+
+def test_http_auth_error_still_preserves_status_for_token_refresh() -> None:
+    state = _HttpAuditState(protocol_mode="2026-07-28")
+    state.pending_error_status = 401
+    original = MCPError(code=INVALID_PARAMS, message="Unauthorized")
+
+    result = state.wrap_error(original)
+
+    assert isinstance(result, UpstreamHttpResponseError)
+    assert result.status_code == 401
+    assert result.__cause__ is original
 
 
 @pytest.mark.asyncio

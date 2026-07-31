@@ -136,8 +136,8 @@ uv run python scripts/mcp_proxy_e2e.py \
   --log-file /tmp/mcp-proxy-modern.log \
   --list-repeat-count 3 \
   --parallel-list-count 10 \
-  --run-readonly-tool-smoke \
-  --run-runscript-smoke
+  --run-protocol-behavior-smoke \
+  --run-all-tools-smoke
 ```
 
 验证 legacy initialize/session 回归：
@@ -149,8 +149,8 @@ uv run python scripts/mcp_proxy_e2e.py \
   --log-file /tmp/mcp-proxy-legacy.log \
   --list-repeat-count 3 \
   --parallel-list-count 10 \
-  --run-readonly-tool-smoke \
-  --run-runscript-smoke
+  --run-protocol-behavior-smoke \
+  --run-all-tools-smoke
 ```
 
 `--run-readonly-tool-smoke` 会依次验证 ListProducts、ListApis、
@@ -160,6 +160,13 @@ ListProductRegions 和 GetApiDefinition；`--list-repeat-count` 可验证同一�
 
 `--run-runscript-smoke` 会执行只读 ECS `DescribeRegions`，保留 RunScript
 返回的 `processID`，并持续调用 `AlibabaCloud___GetTask` 直到真实终态。
+`--run-all-tools-smoke` 会验证预发完整 15 工具契约：检索、文档和命令生成
+工具执行真实只读调用，GetPresignedUrl 仅签发 60 秒上传票据且不上传文件，
+RunScript/GetTask 执行只读 `DescribeRegions`，RunIaC 使用空参数验证其在创建
+进程前返回 `ValidationFailed`。`--run-protocol-behavior-smoke` 还会验证 ping、
+未知工具、缺少必填参数以及 prompts/resources 的协议行为；现代协议应拒绝
+已移除的非 tools 方法，legacy 则按上游能力转发。`--print-tool-contracts`
+仅输出工具名和 input schema 的字段结构，不输出 description 或响应正文。
 Proxy debug 日志只记录上游 method、protocol mode、HTTP status 和 session
 header 是否存在，不记录 bearer token、工具参数或临时凭证。
 

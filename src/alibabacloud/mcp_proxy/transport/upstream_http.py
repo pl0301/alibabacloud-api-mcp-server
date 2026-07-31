@@ -15,6 +15,7 @@ if sys.version_info < (3, 11):
     from exceptiongroup import BaseExceptionGroup  # type: ignore[no-redef]
 from mcp import Client, types
 from mcp.client.streamable_http import streamable_http_client
+from mcp.shared.exceptions import MCPError
 from pydantic import AnyUrl
 
 from alibabacloud.mcp_proxy import __version__
@@ -55,6 +56,12 @@ class _HttpAuditState:
             return error
         status_code = self.pending_error_status
         self.pending_error_status = None
+        if (
+            400 <= status_code < 500
+            and status_code not in (401, 403)
+            and isinstance(error, MCPError)
+        ):
+            return error
         return UpstreamHttpResponseError(status_code, error)
 
 
