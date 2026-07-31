@@ -8,6 +8,9 @@ from pathlib import Path
 import pytest
 from mcp import types
 
+if sys.version_info < (3, 11):
+    from exceptiongroup import ExceptionGroup
+
 _SCRIPT_PATH = (
     Path(__file__).resolve().parents[1] / "scripts" / "mcp_proxy_e2e.py"
 )
@@ -25,6 +28,191 @@ build_runscript_arguments = _MODULE.build_runscript_arguments
 extract_result_payload = _MODULE.extract_result_payload
 sanitize_output = _MODULE.sanitize_output
 validate_successful_task = _MODULE.validate_successful_task
+
+
+def test_readonly_tool_matrix_uses_strict_nondestructive_arguments() -> None:
+    assert _MODULE.build_readonly_tool_cases() == (
+        (
+            "AlibabaCloud___ListProducts",
+            {"filter": "Ecs"},
+        ),
+        (
+            "AlibabaCloud___ListApis",
+            {
+                "product": "Ecs",
+                "apiVersion": "2014-05-26",
+                "filter": "DescribeRegions",
+                "includeApiDefinition": False,
+            },
+        ),
+        (
+            "AlibabaCloud___ListProductRegions",
+            {"product": "Ecs"},
+        ),
+        (
+            "AlibabaCloud___GetApiDefinition",
+            {
+                "product": "Ecs",
+                "apiVersion": "2014-05-26",
+                "apiName": "DescribeRegions",
+            },
+        ),
+    )
+
+
+def test_readonly_result_summary_proves_nonempty_response_without_dumping_body() -> None:
+    result = types.CallToolResult(
+        content=[
+            types.TextContent(
+                type="text",
+                text='{"items":[{"name":"DescribeRegions"}]}',
+            )
+        ],
+        structuredContent={"items": [{"name": "DescribeRegions"}]},
+        isError=False,
+    )
+
+    assert _MODULE.summarize_readonly_tool_result(
+        "AlibabaCloud___GetApiDefinition",
+        result,
+    ) == {
+        "phase": "readonly-tool",
+        "tool": "AlibabaCloud___GetApiDefinition",
+        "isError": False,
+        "contentCount": 1,
+        "structuredContentType": "dict",
+        "responseNonempty": True,
+    }
+
+
+def test_readonly_result_summary_rejects_empty_response() -> None:
+    result = types.CallToolResult(content=[], isError=False)
+
+    with pytest.raises(RuntimeError, match="empty response"):
+        _MODULE.summarize_readonly_tool_result(
+            "AlibabaCloud___ListProducts",
+            result,
+        )
+
+
+@pytest.mark.asyncio
+async def test_readonly_smoke_calls_every_case_once(capsys) -> None:
+    class RecordingClient:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict[str, object]]] = []
+
+        async def call_tool(
+            self,
+            name: str,
+            arguments: dict[str, object],
+        ) -> types.CallToolResult:
+            self.calls.append((name, arguments))
+            return types.CallToolResult(
+                content=[
+                    types.TextContent(
+                        type="text",
+                        text='{"ok":true}',
+                    )
+                ],
+                isError=False,
+            )
+
+    client = RecordingClient()
+
+    await _MODULE._run_readonly_tool_smoke(client)
+
+    assert tuple(client.calls) == _MODULE.build_readonly_tool_cases()
+    assert capsys.readouterr().out.count('"phase": "readonly-tool"') == 4
+
+
+def test_parser_accepts_fixed_modern_mode_and_repeated_list_calls() -> None:
+    args = _MODULE.build_parser().parse_args(
+        [
+            "--server-url",
+            "https://example.com/mcp",
+            "--mode",
+            "2026-07-28",
+            "--log-file",
+            "/tmp/proxy.log",
+            "--list-repeat-count",
+            "3",
+            "--parallel-list-count",
+            "10",
+            "--run-readonly-tool-smoke",
+        ]
+    )
+
+    assert args.mode == "2026-07-28"
+    assert args.list_repeat_count == 3
+    assert args.parallel_list_count == 10
+    assert args.run_readonly_tool_smoke is True
+
+
+@pytest.mark.asyncio
+async def test_parallel_list_smoke_collects_every_response(capsys) -> None:
+    class RecordingClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def list_tools(self) -> types.ListToolsResult:
+            self.calls += 1
+            return types.ListToolsResult(
+                tools=[
+                    types.Tool(
+                        name="ExampleTool",
+                        inputSchema={"type": "object"},
+                    )
+                ],
+                resultType="complete",
+            )
+
+    client = RecordingClient()
+
+    await _MODULE._run_parallel_list_smoke(
+        client,
+        count=10,
+        require_complete=True,
+    )
+
+    output = capsys.readouterr().out
+    assert client.calls == 10
+    assert '"phase": "tools/list-parallel"' in output
+    assert '"requestCount": 10' in output
+    assert '"toolCounts": [\n    1' in output
+
+
+def test_main_collapses_sdk_exception_group_to_safe_leaf_message(
+    monkeypatch,
+    capsys,
+) -> None:
+    def raise_group(*args, **kwargs) -> None:
+        raise ExceptionGroup(
+            "stdio transport failed",
+            [
+                ExceptionGroup(
+                    "client session failed",
+                    [RuntimeError("upstream authentication failed")],
+                )
+            ],
+        )
+
+    monkeypatch.setattr(_MODULE.anyio, "run", raise_group)
+
+    exit_code = _MODULE.main(
+        [
+            "--server-url",
+            "https://example.com/mcp",
+            "--mode",
+            "2026-07-28",
+            "--log-file",
+            "/tmp/proxy.log",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert captured.err == "Error: upstream authentication failed\n"
+    assert "Traceback" not in captured.err
 
 
 def test_extract_result_payload_from_structured_content() -> None:

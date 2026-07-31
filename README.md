@@ -134,6 +134,9 @@ uv run python scripts/mcp_proxy_e2e.py \
   --server-url "$MCP_PRE_URL" \
   --mode auto \
   --log-file /tmp/mcp-proxy-modern.log \
+  --list-repeat-count 3 \
+  --parallel-list-count 10 \
+  --run-readonly-tool-smoke \
   --run-runscript-smoke
 ```
 
@@ -144,8 +147,16 @@ uv run python scripts/mcp_proxy_e2e.py \
   --server-url "$MCP_PRE_URL" \
   --mode legacy \
   --log-file /tmp/mcp-proxy-legacy.log \
+  --list-repeat-count 3 \
+  --parallel-list-count 10 \
+  --run-readonly-tool-smoke \
   --run-runscript-smoke
 ```
+
+`--run-readonly-tool-smoke` 会依次验证 ListProducts、ListApis、
+ListProductRegions 和 GetApiDefinition；`--list-repeat-count` 可验证同一连接上的
+重复请求，`--parallel-list-count` 可验证同一 stdio 连接上的并发请求。使用
+`--mode 2026-07-28` 可以跳过 discover，直接验证 modern 业务首包。
 
 `--run-runscript-smoke` 会执行只读 ECS `DescribeRegions`，保留 RunScript
 返回的 `processID`，并持续调用 `AlibabaCloud___GetTask` 直到真实终态。

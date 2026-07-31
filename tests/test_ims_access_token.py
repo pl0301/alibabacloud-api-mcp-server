@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 
 import pytest
 
@@ -11,6 +11,8 @@ from alibabacloud.mcp_proxy.auth.ims_access_token import (
     parse_ims_generate_access_token_body,
 )
 from alibabacloud.mcp_proxy.auth.token_provider import TokenAcquisitionError
+
+UTC = timezone.utc
 
 
 def test_parse_ims_body_extracts_access_token_pascal_case() -> None:

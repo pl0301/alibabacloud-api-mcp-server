@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import anyio
 import pytest
 from mcp import types
 
@@ -321,3 +322,67 @@ async def test_tool_error_result_is_returned_without_retry() -> None:
 
     assert result.is_error is True
     assert connection_factory.connect_calls == [("token", MODERN_PROTOCOL_MODE)]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_same_era_requests_share_one_connection() -> None:
+    token_provider = FakeTokenProvider(["token"])
+    connection_factory = FakeConnectionFactory(fail_first_connection=False)
+    session = ReconnectingSession(
+        connection_factory,
+        token_provider,
+        RetrySettings(max_attempts=1, base_delay_seconds=0.01, max_delay_seconds=0.01),
+    )
+    results: list[types.ListToolsResult] = []
+
+    async def list_tools() -> None:
+        results.append(
+            await session.list_tools(protocol_mode=MODERN_PROTOCOL_MODE)
+        )
+
+    async with anyio.create_task_group() as task_group:
+        for _ in range(10):
+            task_group.start_soon(list_tools)
+
+    assert len(results) == 10
+    assert connection_factory.connect_calls == [
+        ("token", MODERN_PROTOCOL_MODE)
+    ]
+    assert len(connection_factory.connections) == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_mixed_era_requests_never_create_two_era_connections() -> None:
+    token_provider = FakeTokenProvider(["token"])
+    connection_factory = FakeConnectionFactory(fail_first_connection=False)
+    session = ReconnectingSession(
+        connection_factory,
+        token_provider,
+        RetrySettings(max_attempts=1, base_delay_seconds=0.01, max_delay_seconds=0.01),
+    )
+    outcomes: list[tuple[ProtocolMode, str]] = []
+
+    async def list_tools(protocol_mode: ProtocolMode) -> None:
+        try:
+            await session.list_tools(protocol_mode=protocol_mode)
+        except ProtocolModeMismatchError:
+            outcomes.append((protocol_mode, "rejected"))
+        else:
+            outcomes.append((protocol_mode, "complete"))
+
+    async with anyio.create_task_group() as task_group:
+        task_group.start_soon(list_tools, "legacy")
+        task_group.start_soon(list_tools, MODERN_PROTOCOL_MODE)
+
+    assert sorted(status for _, status in outcomes) == ["complete", "rejected"]
+    assert len(connection_factory.connect_calls) == 1
+    connected_mode = connection_factory.connect_calls[0][1]
+    assert outcomes == [
+        (connected_mode, "complete"),
+        (
+            MODERN_PROTOCOL_MODE
+            if connected_mode == "legacy"
+            else "legacy",
+            "rejected",
+        ),
+    ]

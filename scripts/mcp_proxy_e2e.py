@@ -14,8 +14,39 @@ import anyio
 from mcp import Client, types
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
+if sys.version_info < (3, 11):
+    from exceptiongroup import BaseExceptionGroup  # type: ignore[no-redef]
+
 RUNSCRIPT_TOOL = "AlibabaCloud___RunScript"
 GET_TASK_TOOL = "AlibabaCloud___GetTask"
+
+READONLY_TOOL_CASES = (
+    (
+        "AlibabaCloud___ListProducts",
+        {"filter": "Ecs"},
+    ),
+    (
+        "AlibabaCloud___ListApis",
+        {
+            "product": "Ecs",
+            "apiVersion": "2014-05-26",
+            "filter": "DescribeRegions",
+            "includeApiDefinition": False,
+        },
+    ),
+    (
+        "AlibabaCloud___ListProductRegions",
+        {"product": "Ecs"},
+    ),
+    (
+        "AlibabaCloud___GetApiDefinition",
+        {
+            "product": "Ecs",
+            "apiVersion": "2014-05-26",
+            "apiName": "DescribeRegions",
+        },
+    ),
+)
 
 RUNSCRIPT_SOURCE = (
     "result = await call_cli(product='Ecs', version='2014-05-26', "
@@ -86,6 +117,13 @@ def _redact_error_message(message: str) -> str:
         if secret:
             redacted = redacted.replace(secret, "<redacted>")
     return redacted
+
+
+def _actionable_error_message(error: BaseException) -> str:
+    if isinstance(error, BaseExceptionGroup) and error.exceptions:
+        return _actionable_error_message(error.exceptions[0])
+    message = str(error).strip()
+    return message or type(error).__name__
 
 
 def _parse_json_object(text: str) -> dict[str, Any] | None:
@@ -195,6 +233,86 @@ def print_json(value: Any) -> None:
     )
 
 
+def build_readonly_tool_cases() -> tuple[tuple[str, dict[str, Any]], ...]:
+    return tuple(
+        (tool_name, dict(arguments))
+        for tool_name, arguments in READONLY_TOOL_CASES
+    )
+
+
+def summarize_readonly_tool_result(
+    tool_name: str,
+    result: types.CallToolResult,
+) -> dict[str, Any]:
+    if result.is_error:
+        raise RuntimeError(f"{tool_name} returned isError=true.")
+
+    response_nonempty = bool(result.structured_content)
+    if not response_nonempty:
+        response_nonempty = any(
+            not isinstance(content, types.TextContent)
+            or bool(content.text.strip())
+            for content in result.content
+        )
+    if not response_nonempty:
+        raise RuntimeError(f"{tool_name} returned an empty response.")
+
+    return {
+        "phase": "readonly-tool",
+        "tool": tool_name,
+        "isError": bool(result.is_error),
+        "contentCount": len(result.content),
+        "structuredContentType": (
+            type(result.structured_content).__name__
+            if result.structured_content is not None
+            else None
+        ),
+        "responseNonempty": True,
+    }
+
+
+async def _run_readonly_tool_smoke(client: Client) -> None:
+    for tool_name, arguments in build_readonly_tool_cases():
+        result = await client.call_tool(tool_name, arguments)
+        print_json(summarize_readonly_tool_result(tool_name, result))
+
+
+async def _run_parallel_list_smoke(
+    client: Client,
+    *,
+    count: int,
+    require_complete: bool,
+) -> None:
+    results: dict[int, types.ListToolsResult] = {}
+
+    async def list_tools(index: int) -> None:
+        result = await client.list_tools()
+        if require_complete and result.result_type != "complete":
+            raise RuntimeError(
+                "Parallel modern tools/list returned "
+                f"resultType={result.result_type!r}"
+            )
+        results[index] = result
+
+    async with anyio.create_task_group() as task_group:
+        for index in range(count):
+            task_group.start_soon(list_tools, index)
+
+    ordered_results = [results[index] for index in range(count)]
+    print_json(
+        {
+            "phase": "tools/list-parallel",
+            "requestCount": count,
+            "resultTypes": [
+                result.result_type for result in ordered_results
+            ],
+            "toolCounts": [
+                len(result.tools) for result in ordered_results
+            ],
+        }
+    )
+
+
 def build_runscript_arguments() -> dict[str, str]:
     """Return only fields accepted by CloudSpec's strict RunScript schema."""
     return {
@@ -278,9 +396,12 @@ async def run_e2e(args: argparse.Namespace) -> None:
         mode=args.mode,
         cache=None,
     ) as client:
-        if args.mode == "auto" and client.protocol_version != "2026-07-28":
+        if (
+            args.mode in ("auto", "2026-07-28")
+            and client.protocol_version != "2026-07-28"
+        ):
             raise RuntimeError(
-                "Modern auto negotiation did not select MCP 2026-07-28: "
+                "Modern connection did not select MCP 2026-07-28: "
                 f"{client.protocol_version}"
             )
 
@@ -297,23 +418,51 @@ async def run_e2e(args: argparse.Namespace) -> None:
             }
         )
 
-        tools_result = await client.list_tools()
-        tool_names = [tool.name for tool in tools_result.tools]
-        print_json(
-            {
-                "phase": "tools/list",
-                "resultType": tools_result.result_type,
-                "toolCount": len(tool_names),
-                "requiredToolsPresent": {
-                    RUNSCRIPT_TOOL: RUNSCRIPT_TOOL in tool_names,
-                    GET_TASK_TOOL: GET_TASK_TOOL in tool_names,
-                },
-            }
-        )
-        if args.mode == "auto" and tools_result.result_type != "complete":
-            raise RuntimeError(
-                f"Modern tools/list returned resultType={tools_result.result_type!r}"
+        tool_names: list[str] = []
+        for iteration in range(1, args.list_repeat_count + 1):
+            tools_result = await client.list_tools()
+            tool_names = [tool.name for tool in tools_result.tools]
+            print_json(
+                {
+                    "phase": "tools/list",
+                    "iteration": iteration,
+                    "resultType": tools_result.result_type,
+                    "toolCount": len(tool_names),
+                    "requiredToolsPresent": {
+                        RUNSCRIPT_TOOL: RUNSCRIPT_TOOL in tool_names,
+                        GET_TASK_TOOL: GET_TASK_TOOL in tool_names,
+                    },
+                }
             )
+            if (
+                args.mode in ("auto", "2026-07-28")
+                and tools_result.result_type != "complete"
+            ):
+                raise RuntimeError(
+                    "Modern tools/list returned "
+                    f"resultType={tools_result.result_type!r}"
+                )
+
+        if args.parallel_list_count:
+            await _run_parallel_list_smoke(
+                client,
+                count=args.parallel_list_count,
+                require_complete=args.mode in ("auto", "2026-07-28"),
+            )
+
+        if args.run_readonly_tool_smoke:
+            missing_readonly_tools = {
+                tool_name
+                for tool_name, _ in READONLY_TOOL_CASES
+                if tool_name not in tool_names
+            }
+            if missing_readonly_tools:
+                raise RuntimeError(
+                    "Required read-only tools are missing: "
+                    f"{sorted(missing_readonly_tools)}"
+                )
+            await _run_readonly_tool_smoke(client)
+
         if args.run_runscript_smoke:
             missing = {
                 RUNSCRIPT_TOOL,
@@ -334,8 +483,26 @@ def build_parser() -> argparse.ArgumentParser:
         )
     )
     parser.add_argument("--server-url", required=True)
-    parser.add_argument("--mode", choices=("auto", "legacy"), required=True)
+    parser.add_argument(
+        "--mode",
+        choices=("auto", "2026-07-28", "legacy"),
+        required=True,
+    )
     parser.add_argument("--log-file", required=True)
+    parser.add_argument(
+        "--list-repeat-count",
+        type=int,
+        default=1,
+        choices=range(1, 11),
+        metavar="1..10",
+    )
+    parser.add_argument(
+        "--parallel-list-count",
+        type=int,
+        default=0,
+        choices=range(0, 21),
+        metavar="0..20",
+    )
     parser.add_argument(
         "--proxy-read-timeout-seconds",
         type=float,
@@ -360,6 +527,10 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--run-readonly-tool-smoke",
+        action="store_true",
+    )
+    parser.add_argument(
         "--run-runscript-smoke",
         action="store_true",
     )
@@ -370,8 +541,9 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         anyio.run(run_e2e, args)
-    except (RuntimeError, TimeoutError, OSError) as exc:
-        print(f"Error: {_redact_error_message(str(exc))}", file=sys.stderr)
+    except Exception as exc:
+        message = _redact_error_message(_actionable_error_message(exc))
+        print(f"Error: {message}", file=sys.stderr)
         return 1
     return 0
 

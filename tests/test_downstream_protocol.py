@@ -221,3 +221,44 @@ async def test_modern_connection_rejects_late_initialize_without_upstream_call()
             await client.session.initialize()
 
     assert session.calls == []
+
+
+@pytest.mark.asyncio
+async def test_modern_wire_rejects_prompts_and_resources_without_upstream_call() -> None:
+    session = DownstreamRecordingSession()
+    proxy = _proxy(session)
+
+    async with Client(
+        proxy_memory_transport(proxy._server),  # noqa: SLF001
+        mode="2026-07-28",
+        cache=None,
+    ) as client:
+        with pytest.raises(MCPError) as prompts_error:
+            await client.session.list_prompts()
+        with pytest.raises(MCPError) as resources_error:
+            await client.session.list_resources()
+
+    assert prompts_error.value.code == -32601
+    assert resources_error.value.code == -32601
+    assert session.calls == []
+
+
+@pytest.mark.asyncio
+async def test_legacy_wire_preserves_prompts_and_resources() -> None:
+    session = DownstreamRecordingSession()
+    proxy = _proxy(session)
+
+    async with Client(
+        proxy_memory_transport(proxy._server),  # noqa: SLF001
+        mode="legacy",
+        cache=None,
+    ) as client:
+        prompts = await client.list_prompts()
+        resources = await client.list_resources()
+
+    assert prompts.prompts == []
+    assert resources.resources == []
+    assert session.calls == [
+        ("prompts/list", "legacy"),
+        ("resources/list", "legacy"),
+    ]
