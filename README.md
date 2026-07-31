@@ -121,6 +121,37 @@
 
 代理工具的安装、MCP 客户端配置、安全策略和预检查说明请参考：[Alibaba Cloud MCP Proxy 使用说明](README-PROXY.md)。
 
+### 本地 Proxy 双协议联合验证
+
+仓库内的 `scripts/mcp_proxy_e2e.py` 会从当前源码启动 Proxy，并通过 stdio
+连接运行时传入的远程 MCP 地址。测试目标和凭证不会写入仓库；请先按
+`README-PROXY.md` 配置凭证，再通过环境变量传入目标地址。
+
+验证 MCP `2026-07-28`（`auto` 会真实执行 `server/discover`）：
+
+```bash
+uv run python scripts/mcp_proxy_e2e.py \
+  --server-url "$MCP_PRE_URL" \
+  --mode auto \
+  --log-file /tmp/mcp-proxy-modern.log \
+  --run-runscript-smoke
+```
+
+验证 legacy initialize/session 回归：
+
+```bash
+uv run python scripts/mcp_proxy_e2e.py \
+  --server-url "$MCP_PRE_URL" \
+  --mode legacy \
+  --log-file /tmp/mcp-proxy-legacy.log \
+  --run-runscript-smoke
+```
+
+`--run-runscript-smoke` 会执行只读 ECS `DescribeRegions`，保留 RunScript
+返回的 `processID`，并持续调用 `AlibabaCloud___GetTask` 直到真实终态。
+Proxy debug 日志只记录上游 method、protocol mode、HTTP status 和 session
+header 是否存在，不记录 bearer token、工具参数或临时凭证。
+
 ## 最佳实践
 
 - 📘 [OpenAPI MCP Server Core 最佳实践](docs/best-practices.md)：介绍如何结合 `Skill` 与 `safety policy`，基于 MCP Server Core 构建高效、安全、适合生产环境的 Agent 集成方案。
