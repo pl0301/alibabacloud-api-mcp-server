@@ -195,16 +195,20 @@ def print_json(value: Any) -> None:
     )
 
 
+def build_runscript_arguments() -> dict[str, str]:
+    """Return only fields accepted by CloudSpec's strict RunScript schema."""
+    return {
+        "script": RUNSCRIPT_SOURCE,
+    }
+
+
 async def _run_runscript_smoke(
     client: Client,
     args: argparse.Namespace,
 ) -> dict[str, Any]:
     run_result = await client.call_tool(
         RUNSCRIPT_TOOL,
-        {
-            "script": RUNSCRIPT_SOURCE,
-            "waitTimeoutSeconds": 0,
-        },
+        build_runscript_arguments(),
     )
     if run_result.is_error:
         raise RuntimeError("AlibabaCloud___RunScript returned isError=true.")

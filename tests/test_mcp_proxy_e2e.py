@@ -21,6 +21,7 @@ NON_TERMINAL_STATUSES = _MODULE.NON_TERMINAL_STATUSES
 RUNSCRIPT_SOURCE = _MODULE.RUNSCRIPT_SOURCE
 TERMINAL_STATUSES = _MODULE.TERMINAL_STATUSES
 build_server_parameters = _MODULE.build_server_parameters
+build_runscript_arguments = _MODULE.build_runscript_arguments
 extract_result_payload = _MODULE.extract_result_payload
 sanitize_output = _MODULE.sanitize_output
 validate_successful_task = _MODULE.validate_successful_task
@@ -181,3 +182,9 @@ def test_runscript_source_calls_read_only_describe_regions() -> None:
     assert "version='2014-05-26'" in RUNSCRIPT_SOURCE
     assert "action='DescribeRegions'" in RUNSCRIPT_SOURCE
     assert "params={}" in RUNSCRIPT_SOURCE
+
+
+def test_runscript_arguments_match_strict_tool_schema() -> None:
+    assert build_runscript_arguments() == {
+        "script": RUNSCRIPT_SOURCE,
+    }
