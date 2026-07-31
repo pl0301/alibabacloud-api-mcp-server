@@ -11,6 +11,11 @@ from pydantic import AnyUrl
 
 from alibabacloud.mcp_proxy.auth.token_provider import CachedBearerTokenProvider
 from alibabacloud.mcp_proxy.config import RetrySettings
+from alibabacloud.mcp_proxy.protocol import (
+    NonRetryableProxyError,
+    ProtocolMode,
+    ProtocolModeMismatchError,
+)
 from alibabacloud.mcp_proxy.safety_policy import apply_safety_policy
 from alibabacloud.mcp_proxy.transport.http_client import ProxyDependencyError
 
@@ -47,7 +52,12 @@ class UpstreamConnection(Protocol):
 
 
 class UpstreamConnectionFactory(Protocol):
-    async def connect(self, *, bearer_token: str) -> UpstreamConnection:
+    async def connect(
+        self,
+        *,
+        bearer_token: str,
+        protocol_mode: ProtocolMode,
+    ) -> UpstreamConnection:
         ...
 
 
@@ -77,50 +87,92 @@ class ReconnectingSession:
         self._safety_policy = safety_policy
         self._allowed_tools = tuple(allowed_tools or ())
         self._connection: UpstreamConnection | None = None
+        self._bound_protocol_mode: ProtocolMode | None = None
         self._policy_applied_for_token: str | None = None
         self._lock = anyio.Lock()
 
-    async def list_tools(self) -> types.ListToolsResult:
-        return await self._run_with_retries("tools/list", lambda conn: conn.list_tools())
+    async def list_tools(
+        self,
+        *,
+        protocol_mode: ProtocolMode,
+    ) -> types.ListToolsResult:
+        return await self._run_with_retries(
+            "tools/list",
+            protocol_mode,
+            lambda conn: conn.list_tools(),
+        )
 
-    async def list_prompts(self) -> types.ListPromptsResult:
-        return await self._run_with_retries("prompts/list", lambda conn: conn.list_prompts())
+    async def list_prompts(
+        self,
+        *,
+        protocol_mode: ProtocolMode,
+    ) -> types.ListPromptsResult:
+        return await self._run_with_retries(
+            "prompts/list",
+            protocol_mode,
+            lambda conn: conn.list_prompts(),
+        )
 
     async def get_prompt(
-        self, name: str, arguments: dict[str, str] | None
+        self,
+        name: str,
+        arguments: dict[str, str] | None,
+        *,
+        protocol_mode: ProtocolMode,
     ) -> types.GetPromptResult:
         return await self._run_with_retries(
             f"prompts/get:{name}",
+            protocol_mode,
             lambda conn: conn.get_prompt(name, arguments),
         )
 
-    async def list_resources(self) -> types.ListResourcesResult:
+    async def list_resources(
+        self,
+        *,
+        protocol_mode: ProtocolMode,
+    ) -> types.ListResourcesResult:
         return await self._run_with_retries(
             "resources/list",
+            protocol_mode,
             lambda conn: conn.list_resources(),
         )
 
-    async def read_resource(self, uri: AnyUrl) -> types.ReadResourceResult:
+    async def read_resource(
+        self,
+        uri: AnyUrl,
+        *,
+        protocol_mode: ProtocolMode,
+    ) -> types.ReadResourceResult:
         return await self._run_with_retries(
             f"resources/read:{uri}",
+            protocol_mode,
             lambda conn: conn.read_resource(uri),
         )
 
     async def call_tool(
-        self, name: str, arguments: dict[str, Any] | None
+        self,
+        name: str,
+        arguments: dict[str, Any] | None,
+        *,
+        protocol_mode: ProtocolMode,
     ) -> types.CallToolResult:
         return await self._run_with_retries(
             f"tools/call:{name}",
+            protocol_mode,
             lambda conn: conn.call_tool(name, arguments),
         )
 
     async def aclose(self) -> None:
         async with self._lock:
-            await self._close_locked()
+            try:
+                await self._close_locked()
+            finally:
+                self._bound_protocol_mode = None
 
     async def _run_with_retries(
         self,
         operation_name: str,
+        protocol_mode: ProtocolMode,
         callback: Callable[[UpstreamConnection], Awaitable[T]],
     ) -> T:
         last_error: Exception | None = None
@@ -129,16 +181,20 @@ class ReconnectingSession:
             stale_connection: UpstreamConnection | None = None
 
             async with self._lock:
+                self._bind_protocol_mode_locked(protocol_mode)
                 force_refresh = retry_state.attempt > 0 and _should_force_refresh(last_error)
                 token = await self._token_provider.get_token(force_refresh=force_refresh)
 
                 try:
-                    connection = await self._ensure_connection_locked(token)
+                    connection = await self._ensure_connection_locked(
+                        token,
+                        protocol_mode,
+                    )
                     return await callback(connection)
-                except ProxyDependencyError:
-                    # A missing local dependency cannot be fixed by reconnecting.
-                    # Preserve the actionable error instead of obscuring it behind
-                    # the generic "failed after N attempts" wrapper.
+                except (ProxyDependencyError, NonRetryableProxyError):
+                    # Dependency, transport-mode, and feature errors are
+                    # permanent for this request. Preserve the actionable
+                    # exception instead of reconnecting or wrapping it.
                     raise
                 except Exception as exc:  # pragma: no cover - depends on upstream SDK exceptions
                     last_error = exc
@@ -173,11 +229,29 @@ class ReconnectingSession:
             f"{self._retry_settings.max_attempts} attempts."
         ) from last_error
 
-    async def _ensure_connection_locked(self, bearer_token: str) -> UpstreamConnection:
+    async def _ensure_connection_locked(
+        self,
+        bearer_token: str,
+        protocol_mode: ProtocolMode,
+    ) -> UpstreamConnection:
         if self._connection is None:
             await self._apply_safety_policy_if_needed(bearer_token)
-            self._connection = await self._connection_factory.connect(bearer_token=bearer_token)
+            self._connection = await self._connection_factory.connect(
+                bearer_token=bearer_token,
+                protocol_mode=protocol_mode,
+            )
         return self._connection
+
+    def _bind_protocol_mode_locked(self, protocol_mode: ProtocolMode) -> None:
+        if self._bound_protocol_mode is None:
+            self._bound_protocol_mode = protocol_mode
+            return
+        if self._bound_protocol_mode != protocol_mode:
+            raise ProtocolModeMismatchError(
+                "Upstream protocol mode is already bound to "
+                f"{self._bound_protocol_mode!r}; cannot switch to "
+                f"{protocol_mode!r}."
+            )
 
     async def _apply_safety_policy_if_needed(self, bearer_token: str) -> None:
         """Apply the safety policy to the bearer token before connecting.
@@ -228,5 +302,7 @@ class ReconnectingSession:
 def _should_force_refresh(error: Exception | None) -> bool:
     if error is None:
         return False
+    if getattr(error, "status_code", None) in (401, 403):
+        return True
     message = str(error).lower()
     return "401" in message or "403" in message or "unauthorized" in message
